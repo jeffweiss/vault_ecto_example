@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+set -o errexit -o errtrace
+
+ECTO_DATABASE=sample_repo
+ECTO_APP=ecto_app
+
+# Start postgres and vault
+docker-compose up -d
+
+echo "Waiting for services to start"
+sleep 3
+
+# Create a vault database superuser
+echo "create role vault_superuser superuser login password 'vault_password';" | psql postgresql://postgres:postgres@localhost
+echo "create database ${ECTO_DATABASE} with owner vault_superuser" | psql postgresql://postgres:postgres@localhost
+
+export VAULT_ADDR=http://localhost:8200
+
+# This predefined root token is declared in the docker-compose.yml
+vault login my_root_token
+
+# We need to ensure the Postgres backend is started for Vault
+vault secrets enable database
+
+vault auth enable approle
+
+vault policy write apps apps-policy.hcl
+vault write auth/approle/role/${ECTO_APP} policies="apps"
+vault read -format=json auth/approle/role/${ECTO_APP}/role-id > sample/priv/credentials/role_id.json
+vault write -format=json -f auth/approle/role/${ECTO_APP}/secret-id > sample/priv/credentials/secret_id.json
+
+vault write database/config/my-postgresql-database plugin_name=postgresql-database-plugin allowed_roles="*" connection_url="postgresql://{{username}}:{{password}}@postgres:5432/${ECTO_DATABASE}?sslmode=disable" username=vault_superuser password=vault_password
+
+vault write database/roles/ecto db_name=my-postgresql-database creation_statements=@ecto.sql default_ttl=1m max_ttl=15m
+
+# Rotate the password for vault_superuser so we no longer know what it is
+vault write -force database/rotate-root/my-postgresql-database
+
+cd sample
+mix deps.get
+mix deps.compile
+mix compile
